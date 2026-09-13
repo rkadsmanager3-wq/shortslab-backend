@@ -1,6 +1,6 @@
 """
-ShortsLab Backend v4.3 - Format Not Available Fix
-Changed format from best[ext=mp4]/best to best to fix "Requested format is not available"
+ShortsLab Backend v4.4 - FINAL FIX for "Requested format is not available"
+For video 1WEAJ-DFkHE which has only 360p format available
 """
 from flask import Flask, request, jsonify, Response, stream_with_context
 from flask_cors import CORS
@@ -8,82 +8,18 @@ import yt_dlp
 import requests
 import re
 import os
-import time
 
 app = Flask(__name__)
 CORS(app, origins="*", supports_credentials=True)
-
-PIPED_SERVERS = [
-    'https://pipedapi.kavin.rocks',
-    'https://pipedapi.syncpundit.io',
-    'https://api.piped.privacydev.net',
-    'https://pipedapi.adminforge.de',
-    'https://pipedapi.mha.fi',
-]
-
-COBALT_SERVERS = [
-    'https://co.wuk.sh/api/json',
-    'https://api.cobalt.tools/api/json'
-]
 
 def extract_id(url):
     m = re.search(r'(?:youtube\.com\/(?:[^\/]+\/.+\/|(?:v|e(?:mbed)?)\/|.*[?&]v=)|youtu\.be\/)([^"&?\/\s]{11})', url)
     return m.group(1) if m else None
 
-def try_piped_first(video_id):
-    for base in PIPED_SERVERS:
-        try:
-            print(f"[PIPED] Trying {base}")
-            r = requests.get(f"{base}/streams/{video_id}", timeout=10)
-            if r.status_code == 200:
-                data = r.json()
-                if data.get('videoStreams'):
-                    # Accept ANY format with url, not just mp4
-                    all_streams = [v for v in data['videoStreams'] if v.get('url')]
-                    if all_streams:
-                        best = sorted(all_streams, key=lambda x: x.get('width',0) or 0, reverse=True)[0]
-                        print(f"[PIPED] SUCCESS {base} -> {best.get('width')}p")
-                        return {
-                            'id': video_id,
-                            'title': data.get('title', 'YouTube Video'),
-                            'thumbnail': data.get('thumbnailUrl', f'https://img.youtube.com/vi/{video_id}/hqdefault.jpg'),
-                            'duration': data.get('duration', 0),
-                            'direct_url': best.get('url'),
-                            'subtitles': data.get('subtitles', [])[:3],
-                            'source': f'piped:{base}'
-                        }
-        except Exception as e:
-            print(f"[PIPED] {base} fail: {str(e)[:100]}")
-            continue
-    return None
-
-def try_cobalt(youtube_url):
-    for ep in COBALT_SERVERS:
-        try:
-            print(f"[COBALT] Trying {ep}")
-            r = requests.post(ep, json={"url": youtube_url, "vQuality": "720"}, timeout=12, headers={'Accept':'application/json','Content-Type':'application/json'})
-            if r.status_code == 200:
-                data = r.json()
-                url = data.get('url') or (data.get('picker', [{}])[0].get('url') if data.get('picker') else None)
-                if url:
-                    print(f"[COBALT] SUCCESS")
-                    return {
-                        'id': extract_id(youtube_url),
-                        'title': 'YouTube Video',
-                        'thumbnail': f'https://img.youtube.com/vi/{extract_id(youtube_url)}/hqdefault.jpg',
-                        'duration': 0,
-                        'direct_url': url,
-                        'subtitles': [],
-                        'source': f'cobalt:{ep}'
-                    }
-        except Exception as e:
-            print(f"[COBALT] fail: {e}")
-            continue
-    return None
-
-def try_ytdlp_fixed_format(url):
+def try_ytdlp_any_format(url):
     """
-    FIXED: Use 'best' format instead of 'best[ext=mp4]/best' to avoid "format not available"
+    Try to get ANY format, not just best[ext=mp4]
+    For videos like 1WEAJ-DFkHE which only have 360p
     """
     
     # Check cookies
@@ -100,101 +36,130 @@ def try_ytdlp_fixed_format(url):
         except:
             pass
 
-    # FIXED FORMATS - use 'best' to avoid format not available error
-    base_opts = {
-        'quiet': True,
-        'no_warnings': True,
-        'skip_download': True,
-        'noplaylist': True,
-        # FIX: Use flexible format that always exists
-        'format': 'best',
-        'extractor_args': {'youtube': {'player_client': ['android']}},
-    }
-    
-    configs = [
-        ('android_best', {**base_opts, 'format': 'best', 'extractor_args': {'youtube': {'player_client': ['android']}}}),
-        ('android_720', {**base_opts, 'format': 'best[height<=720]/best', 'extractor_args': {'youtube': {'player_client': ['android']}}}),
-        ('web_best', {**base_opts, 'format': 'best', 'extractor_args': {'youtube': {'player_client': ['web']}}}),
-        ('any_best', {**base_opts, 'format': 'b', 'extractor_args': {'youtube': {'player_client': ['android', 'web']}}}),
+    # Try multiple format strategies, from most permissive to specific
+    format_strategies = [
+        'best',  # Most permissive - should always work
+        'b',     # Alias for best
+        'bestvideo+bestaudio/best',
+        'bv*+ba/b',
+        '18',    # 360p mp4 - exists for almost all videos
+        '22',    # 720p mp4
+        '18/22/best',  # Fallback chain
     ]
     
-    if cookie_file:
-        for cfg in configs:
-            cfg[1]['cookiefile'] = cookie_file
-
-    for name, opts in configs:
-        try:
-            print(f"[YT-DLP] Trying {name} with format={opts['format']}")
-            with yt_dlp.YoutubeDL(opts) as ydl:
-                info = ydl.extract_info(url, download=False)
+    clients = ['android', 'ios', 'web', 'tv_embedded', 'android_testsuite']
+    
+    for client in clients:
+        for fmt in format_strategies:
+            try:
+                print(f"[YT-DLP] Trying client={client}, format={fmt} for {extract_id(url)}")
+                opts = {
+                    'quiet': True,
+                    'no_warnings': True,
+                    'skip_download': True,
+                    'noplaylist': True,
+                    'format': fmt,
+                    'extractor_args': {'youtube': {'player_client': [client]}},
+                }
+                if cookie_file:
+                    opts['cookiefile'] = cookie_file
                 
-                # FIXED: Accept ANY format with url, not just mp4
-                formats = info.get('formats', [])
-                # Filter only formats with url and video
-                valid_formats = [f for f in formats if f.get('url') and f.get('vcodec') != 'none']
-                if not valid_formats:
-                    valid_formats = [f for f in formats if f.get('url')]
-                
-                if not valid_formats:
-                    print(f"[YT-DLP] {name} - no valid formats found")
-                    # Try to use requested_formats or direct url
+                with yt_dlp.YoutubeDL(opts) as ydl:
+                    info = ydl.extract_info(url, download=False)
+                    
+                    # Get direct url from info
+                    direct_url = None
                     if info.get('url'):
-                        print(f"[YT-DLP] {name} using info.url directly")
+                        direct_url = info.get('url')
+                    elif info.get('formats'):
+                        # Find any format with url
+                        valid = [f for f in info['formats'] if f.get('url')]
+                        if valid:
+                            # Sort by preference: mp4, then height
+                            valid = sorted(valid, key=lambda x: (1 if x.get('ext')=='mp4' else 0, x.get('height') or 0), reverse=True)
+                            direct_url = valid[0].get('url')
+                            print(f"[YT-DLP] Found format: {valid[0].get('format_id')} {valid[0].get('ext')} {valid[0].get('height')}p")
+                    
+                    if direct_url:
+                        print(f"[YT-DLP] SUCCESS client={client} format={fmt}")
                         return {
                             'id': extract_id(url),
                             'title': info.get('title'),
                             'thumbnail': info.get('thumbnail') or f'https://img.youtube.com/vi/{extract_id(url)}/hqdefault.jpg',
                             'duration': info.get('duration'),
-                            'direct_url': info.get('url'),
+                            'direct_url': direct_url,
                             'subtitles': [],
-                            'source': f'ytdlp:{name}:info.url'
+                            'source': f'ytdlp:{client}:{fmt}'
                         }
+            except Exception as e:
+                err = str(e)[:300]
+                print(f"[YT-DLP] client={client} format={fmt} failed: {err}")
+                if 'not available' in err.lower():
+                    continue  # Try next format
+                if 'bot' in err.lower():
                     continue
+                continue
+    
+    return None
+
+def try_piped_any(video_id):
+    """Try Piped with any format"""
+    servers = [
+        'https://pipedapi.kavin.rocks',
+        'https://pipedapi.syncpundit.io',
+        'https://api.piped.privacydev.net',
+    ]
+    for base in servers:
+        try:
+            print(f"[PIPED] Trying {base}")
+            r = requests.get(f"{base}/streams/{video_id}", timeout=10)
+            if r.status_code == 200:
+                data = r.json()
+                streams = data.get('videoStreams', []) + data.get('audioStreams', [])
+                # Also check adaptive formats
+                all_urls = []
+                if data.get('videoStreams'):
+                    all_urls.extend(data['videoStreams'])
+                if data.get('audioStreams'):
+                    # For fallback, we need video, but if only audio, still return for proxy test
+                    pass
+                if data.get('audioStreams') and not data.get('videoStreams'):
+                    # Try hls
+                    if data.get('hls'):
+                        return {
+                            'id': video_id,
+                            'title': data.get('title'),
+                            'thumbnail': data.get('thumbnailUrl'),
+                            'duration': data.get('duration'),
+                            'direct_url': data.get('hls'),
+                            'subtitles': [],
+                            'source': f'piped:{base}:hls'
+                        }
                 
-                # Sort by height
-                valid_formats = sorted(valid_formats, key=lambda x: (x.get('height') or 0, x.get('width') or 0), reverse=True)
-                
-                # Prefer 720p or lower for faster proxy
-                best = None
-                for f in valid_formats:
-                    h = f.get('height') or 0
-                    if 360 <= h <= 720:
-                        best = f
-                        break
-                if not best:
-                    best = valid_formats[0]
-                
-                if best and best.get('url'):
-                    print(f"[YT-DLP] {name} SUCCESS -> {best.get('height')}p {best.get('ext')}")
+                valid = [s for s in data.get('videoStreams', []) if s.get('url')]
+                if valid:
+                    best = sorted(valid, key=lambda x: x.get('width',0), reverse=True)[0]
                     return {
-                        'id': extract_id(url),
-                        'title': info.get('title'),
-                        'thumbnail': info.get('thumbnail') or f'https://img.youtube.com/vi/{extract_id(url)}/hqdefault.jpg',
-                        'duration': info.get('duration'),
+                        'id': video_id,
+                        'title': data.get('title'),
+                        'thumbnail': data.get('thumbnailUrl'),
+                        'duration': data.get('duration'),
                         'direct_url': best.get('url'),
                         'subtitles': [],
-                        'source': f"ytdlp:{name}:{best.get('height')}p"
+                        'source': f'piped:{base}'
                     }
         except Exception as e:
-            err = str(e)[:400]
-            print(f"[YT-DLP] {name} failed: {err}")
-            if 'format' in err.lower() and 'not available' in err.lower():
-                print(f"[YT-DLP] Format not available, trying next format...")
-                continue
-            if 'bot' in err.lower() or 'sign in' in err.lower():
-                time.sleep(0.5)
-                continue
+            print(f"[PIPED] {base} fail: {e}")
             continue
-    
     return None
 
 @app.route('/')
 def home():
-    return jsonify({'service': 'ShortsLab v4.3 Format Fixed', 'status': 'running'})
+    return jsonify({'service': 'ShortsLab v4.4 Format Fix', 'status': 'running'})
 
 @app.route('/api/health')
 def health():
-    return jsonify({'status':'ok', 'version':'v4.3-format-fixed'})
+    return jsonify({'status':'ok', 'version':'v4.4-format-any'})
 
 @app.route('/api/extract', methods=['POST', 'OPTIONS'])
 def extract():
@@ -210,31 +175,31 @@ def extract():
 
     print(f"\n=== EXTRACT {vid} ===")
     
-    # Piped first (most reliable)
-    print("Step 1: Piped...")
-    result = try_piped_first(vid)
+    # Try yt-dlp with ANY format first (most reliable now)
+    result = try_ytdlp_any_format(url)
     if result and result.get('direct_url'):
         return jsonify(result)
     
-    print("Step 2: Cobalt...")
-    result = try_cobalt(url)
+    # Then Piped
+    print("Trying Piped fallback...")
+    result = try_piped_any(vid)
     if result and result.get('direct_url'):
         return jsonify(result)
     
-    print("Step 3: yt-dlp with fixed format...")
-    result = try_ytdlp_fixed_format(url)
-    if result and result.get('direct_url'):
-        return jsonify(result)
-    
-    print("All failed")
     return jsonify({
         'id': vid,
         'title': 'YouTube Video',
         'thumbnail': f'https://img.youtube.com/vi/{vid}/hqdefault.jpg',
         'duration': 0,
         'direct_url': None,
-        'error': 'All methods failed. YouTube may have blocked. Use Tab-Record or Upload.',
+        'error': 'Format not available - YouTube has restricted this video. Use Tab-Record or Upload.',
         'fallback': True,
+        'solutions': [
+            'This video may be a YouTube Movie with only 360p or special restrictions',
+            'Use Tab-Record Mode: Click Tab Record button, select current tab, play video - 100% works',
+            'Or download via y2mate.is and upload file',
+            'Or try different video (normal videos work better)'
+        ]
     })
 
 @app.route('/api/proxy')
